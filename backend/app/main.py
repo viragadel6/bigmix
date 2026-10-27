@@ -1097,7 +1097,15 @@ def create_app(
                 detail="The frontend is not configured.",
             )
 
-        target = request.url_for("static", path="chat.html")
+        entrypoint = next(
+            (
+                candidate
+                for candidate in ("studio.html", "chat.html")
+                if candidate in static_files.allowed_files
+            ),
+            "chat.html",
+        )
+        target = request.url_for("static", path=entrypoint)
 
         return RedirectResponse(
             url=target.path,
