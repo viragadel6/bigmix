@@ -740,14 +740,15 @@
     var clean = String(value || "")
       .replace(/\s+/g, " ")
       .trim();
-    if (clean.length <= maxLength) {
-      return clean;
+    var clipped = clean.length > maxLength;
+
+    if (clean.length > maxLength) {
+      clean = clean.slice(0, Math.max(1, maxLength - 1));
     }
-    return (
-      clean
-        .slice(0, Math.max(1, maxLength - 1))
-        .replace(/[\s,.;:—–-]+$/, "") + "…"
-    );
+
+    clean = clean.replace(/[\s,;:—–-]+$/, "");
+
+    return { text: clean, clipped: clipped };
   }
 
   function safeFilename(value, fallback) {
@@ -790,6 +791,22 @@
 
   function isReducedMotion() {
     return Boolean(REDUCED_MOTION && REDUCED_MOTION.matches);
+  }
+
+  function isTouchFirst() {
+    if (window.matchMedia) {
+      if (window.matchMedia("(hover: none), (pointer: coarse)").matches) {
+        return true;
+      }
+      if (window.matchMedia("(hover: hover), (pointer: fine)").matches) {
+        return false;
+      }
+    }
+
+    return typeof navigator !== "undefined" &&
+      Number(navigator.maxTouchPoints) > 0
+      ? true
+      : false;
   }
 
   /* ------------------------------------------------------------------------
@@ -1148,6 +1165,21 @@
     });
   }
 
+  function fingerprintPixels(imageData) {
+    var data = imageData.data;
+    var total = data.length / 4;
+    var stride = Math.max(1, Math.floor(total / 512));
+    var hash = 0x811c9dc5;
+
+    for (var index = 0; index < total; index += stride) {
+      var offset = index * 4;
+      hash ^= data[offset] + (data[offset + 1] << 8) + (data[offset + 2] << 16);
+      hash = Math.imul(hash, 16777619) >>> 0;
+    }
+
+    return hash.toString(16);
+  }
+
   function createThumbnail(image) {
     try {
       var width = image.naturalWidth || image.width;
@@ -1367,10 +1399,12 @@
       );
     }
 
+    // The seed is derived from the pixels themselves, so re-running the same
+    // instruction on the same frame always yields byte-identical output.
     var seed = hashString(
       [
         style.id,
-        source.key || source.src.slice(0, 96),
+        fingerprintPixels(imageData),
         width + "x" + height,
         normalizePrompt(prompt)
       ].join("|")
@@ -1921,12 +1955,22 @@
 
   function buildHint() {
     if (state.busy) {
-      return "Hold tight — the current render is finishing.";
+      return isTouchFirst()
+        ? "Rendering — one moment."
+        : "Hold tight — the current render is finishing.";
     }
 
     var count = state.pending.length;
 
     if (count && refs.prompt.value.trim()) {
+      if (isTouchFirst()) {
+        return (
+          count +
+          " " +
+          plural(count, "image") +
+          " ready · tap send to render"
+        );
+      }
       return (
         count +
         " " +
@@ -1941,12 +1985,16 @@
         " " +
         plural(count, "image") +
         (count === 1 ? " is" : "s are") +
-        " attached — add an instruction, or send as is"
+        (isTouchFirst()
+          ? " attached — add an instruction, or send as is"
+          : " attached — press Enter to send, or send as is")
       );
     }
 
     if (state.lastResult) {
-      return "Nothing attached — your note will continue from the last result";
+      return isTouchFirst()
+        ? "Continues from the last result"
+        : "Nothing attached — your note continues from the last result";
     }
 
     return "Attach an image to begin.";
@@ -2158,7 +2206,7 @@
       width = maxHeight * safeRatio;
     }
 
-    return Math.round(clamp(width, 200, 520));
+    return Math.round(clamp(width, 150, 520));
   }
 
   function updateResultWidths() {
@@ -2319,12 +2367,17 @@
     );
 
     if (prompt) {
-      paragraph.append(document.createTextNode(" You asked for "));
+      var requested = excerpt(prompt, LONG_PROMPT);
+      var quoted = requested.text.replace(/[.!?]+$/, "");
+
+      paragraph.append(document.createTextNode(" Your note — "));
       paragraph.append(
-        h("em", { text: "“" + excerpt(prompt, LONG_PROMPT) + "”" })
+        h("em", {
+          text: "“" + quoted + (requested.clipped ? "…”" : "”")
+        })
       );
       paragraph.append(
-        document.createTextNode(", which set the direction.")
+        document.createTextNode(" — set the direction.")
       );
     }
 
@@ -3185,9 +3238,14 @@
     });
 
     refs.fileInput.addEventListener("change", function (event) {
-      var files = event.target.files;
+      // Copy the FileList first: resetting the input clears it in every engine,
+      // and we reset so choosing the same file twice still fires a change.
+      var files = Array.prototype.slice.call(
+        (event.target && event.target.files) || []
+      );
       event.target.value = "";
-      if (files && files.length) {
+
+      if (files.length) {
         void intakeFiles(files);
       }
     });
