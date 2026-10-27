@@ -1,18 +1,21 @@
 /* ==========================================================================
    Bigmix Studio
    --------------------------------------------------------------------------
-   A conversational image editor that runs entirely in the browser.
+   A conversational image editor.
 
    Pipeline for every turn:
-     1. The attached File is read into a data URL (FileReader).
-     2. The image is drawn onto an off-screen <canvas> at its native size.
-     3. A deterministic, prompt-driven colour grade is applied with the
-        Canvas 2D API, writing directly into an ImageData buffer.
-     4. The canvas is exported as a JPEG data URL and appended to the
-        assistant message.
+     1. The source frame and every attached reference are posted to the
+        project's image API — POST /api/images/edits when there is something
+        to reference, POST /api/images/generate when there is not. The API in
+        turn calls flymyai/nano-banana-2_1.
+     2. The image the model returns (already inlined as a data URL by the API)
+        becomes the assistant message, at its own aspect ratio.
+     3. If the API is unreachable, rate limited or the model is not configured
+        on the server, the turn falls back to the deterministic Canvas 2D
+        grade below and the reply says so.
 
-   Nothing is uploaded. The previous result can be used as the source for the
-   next round, so edits can continue indefinitely.
+   The previous result can be used as the source for the next round, so edits
+   can continue indefinitely.
    ========================================================================== */
 
 (function () {
@@ -23,13 +26,39 @@
      ------------------------------------------------------------------------ */
 
   var MAX_FILES = 8;
-  var MAX_BYTES = 20 * 1024 * 1024;
+  var MAX_BYTES = 10 * 1024 * 1024;
+  var MAX_BYTES_LABEL = "10 MB";
   var MAX_PIXELS = 52 * 1000 * 1000;
   var MIN_SIDE = 24;
   var EXPORT_QUALITY = 0.92;
   var THUMBNAIL_SIZE = 120;
   var MIN_RENDER_MS = 820;
   var LONG_PROMPT = 132;
+
+  /* The image API the studio talks to. The model name is only a fallback:
+     GET /api/images/options reports the real one and the pill follows it. */
+  var IMAGE_API = {
+    options: "/api/images/options",
+    generate: "/api/images/generate",
+    edits: "/api/images/edits"
+  };
+
+  var IMAGE_MODEL_FALLBACK = "flymyai/nano-banana-2_1";
+  var IMAGE_DEFAULTS = {
+    aspect_ratio: "auto",
+    resolution: "1K",
+    num_images: 1,
+    thinking_level: "medium",
+    safety_tolerance: "4",
+    enable_web_search: false
+  };
+
+  /* A synchronous model call is capped at 120 s on the server. */
+  var REQUEST_TIMEOUT_MS = 150 * 1000;
+  var OPTIONS_TIMEOUT_MS = 8 * 1000;
+  var MAX_TOTAL_REFERENCE_BYTES = 56 * 1000 * 1000;
+  var MAX_REFERENCE_COUNT = 8;
+
 
   var VIDEO_EXTENSIONS = ["mp4", "mov", "webm"];
 
@@ -518,12 +547,45 @@
     ]
   };
 
+  var MODEL_STAGES = [
+    "Sending the frame",
+    "Reading your direction",
+    "The model is rendering",
+    "Collecting the result"
+  ];
+
   var WORKING_STAGES = [
     "Reading the frame",
     "Balancing the light",
     "Applying the grade",
     "Exporting the JPEG"
   ];
+
+  var FORMAT_LABELS = {
+    "image/jpeg": "JPEG",
+    "image/png": "PNG",
+    "image/webp": "WebP",
+    "image/heic": "HEIC",
+    "image/heif": "HEIF",
+    "image/gif": "GIF"
+  };
+
+  var API_ERROR_COPY = {
+    IMAGE_PROVIDER_UNAVAILABLE:
+      "The image model isn’t configured on this server — no FlyMyAI key is set.",
+    IMAGE_UPSTREAM_FAILED: "The image model rejected the request.",
+    IMAGE_UPSTREAM_TIMEOUT: "The image model took too long to answer.",
+    IMAGE_REQUEST_CANCELLED: "The image request was cancelled.",
+    INVALID_ORIGIN: "This page isn’t allowed to call the image API.",
+    MISSING_PROMPT: "The image model needs a written direction.",
+    INVALID_IMAGE_REQUEST: "The server couldn’t accept that request.",
+    REQUEST_TOO_LARGE: "That request was too large for the server.",
+    REFERENCE_TOO_LARGE: "One of the attachments is too large for the server.",
+    REFERENCE_UNSUPPORTED: "One of the attachments isn’t a supported image.",
+    UNSUPPORTED_MEDIA_TYPE: "The server doesn’t accept that file type.",
+    IMAGE_DOWNLOAD_FAILED: "The server couldn’t read one of the attachments.",
+    INTERNAL_ERROR: "The server hit an unexpected error."
+  };
 
   /* ------------------------------------------------------------------------
      Cached lookups
@@ -565,7 +627,12 @@
     lightboxImage: byId("lightbox-image"),
     lightboxClose: byId("lightbox-close"),
     lightboxDownload: byId("lightbox-download"),
-    lightboxEdit: byId("lightbox-edit")
+    lightboxEdit: byId("lightbox-edit"),
+    enginePill: byId("engine-pill"),
+    engineLabel: byId("engine-label"),
+    engineTech: byId("engine-tech"),
+    composerEngine: byId("composer-engine-label"),
+    dropzoneCopy: byId("dropzone-copy")
   };
 
   var suggestions = Array.prototype.slice.call(
@@ -584,7 +651,10 @@
     busy: false,
     generation: 0,
     menuOpen: false,
-    renderCount: 0
+    renderCount: 0,
+    imageOptions: null,
+    imageModel: IMAGE_MODEL_FALLBACK,
+    apiState: "unknown"
   };
 
   var activeJobs = new Set();
@@ -1555,7 +1625,9 @@
       }
 
       if (file.size > MAX_BYTES) {
-        problems.push("“" + (file.name || "That image") + "” is larger than 20 MB.");
+        problems.push(
+          "“" + (file.name || "That image") + "” is larger than " + MAX_BYTES_LABEL + "."
+        );
         continue;
       }
 
@@ -1653,7 +1725,7 @@
         key: "result:" + result.id,
         name: safeFilename(result.filename, "bigmix-" + result.styleId + ".jpg"),
         size: dataUrlByteLength(result.src),
-        type: "image/jpeg",
+        type: result.mime || "image/jpeg",
         src: result.src,
         thumb: thumbnail || result.src,
         width: result.width,
@@ -1782,7 +1854,7 @@
           ? " · original"
           : attachment.origin === "sample"
             ? " · sample frame"
-            : " · local render"),
+            : " · studio result"),
       downloadName: downloadNameFor(attachment),
       alt: attachment.name
     };
@@ -1957,8 +2029,8 @@
   function buildHint() {
     if (state.busy) {
       return isTouchFirst()
-        ? "Rendering — one moment."
-        : "Hold tight — the current render is finishing.";
+        ? "Rendering — this can take a moment."
+        : "The image model is rendering this frame — hold tight.";
     }
 
     var count = state.pending.length;
@@ -2353,19 +2425,48 @@
       paragraph.append(document.createTextNode("No written direction this round, so "));
     }
 
-    paragraph.append(h("strong", { text: style.label }));
+    paragraph.append(h("strong", { text: result.label }));
 
-    paragraph.append(
-      document.createTextNode(
-        " — " +
-          pickResponse(style.id, style.id + "|" + result.id + "|" + prompt) +
-          " No crop and no resample: the frame is still " +
+    if (payload.engine === "model") {
+      var described = String(payload.description || "")
+        .replace(/\s+/g, " ")
+        .trim();
+
+      if (!described) {
+        described =
+          "returned a new frame from your " +
+          (request.implicit ? "previous result" : "reference") +
+          ", at " +
           result.width +
           " × " +
           result.height +
-          ", with the composition, focus and edges exactly where they were."
-      )
-    );
+          ".";
+      } else {
+        if (!/[.!?…]$/.test(described)) {
+          described += ".";
+        }
+        described +=
+          " The returned frame is " +
+          result.width +
+          " × " +
+          result.height +
+          ".";
+      }
+
+      paragraph.append(document.createTextNode(" — " + described));
+    } else {
+      paragraph.append(
+        document.createTextNode(
+          " — " +
+            pickResponse(style.id, style.id + "|" + result.id + "|" + prompt) +
+            " The frame is still " +
+            result.width +
+            " × " +
+            result.height +
+            ", with the composition, focus and edges exactly where they were."
+        )
+      );
+    }
 
     if (prompt) {
       var requested = excerpt(prompt, LONG_PROMPT);
@@ -2400,26 +2501,44 @@
     return paragraph;
   }
 
-  function resultRecord(result, style) {
+  function formatPrice(value) {
+    var price =
+      typeof value === "number"
+        ? value
+        : Number(String(value || "").replace(/[^0-9.]/g, ""));
+
+    if (!Number.isFinite(price) || price <= 0) {
+      return "";
+    }
+
+    return "$" + price.toFixed(price < 1 ? 3 : 2);
+  }
+
+  function resultRecord(result) {
+    var meta = "";
+    var price = formatPrice(result.price);
+
+    meta += result.width + " × " + result.height;
+    meta += " · " + result.format;
+    meta += " · " + result.label;
+
+    if (price) {
+      meta += " · " + price;
+    }
+
     return {
       src: result.src,
       title: result.filename,
-      meta:
-        result.width +
-        " × " +
-        result.height +
-        " · JPEG · " +
-        style.label +
-        " · rendered locally",
+      meta: meta,
       downloadName: result.filename,
-      alt: style.label + " edit, " + result.width + " by " + result.height,
+      alt: result.label + " image, " + result.width + " by " + result.height,
       onEdit: function () {
         return addResultAttachment(result);
       }
     };
   }
 
-  function buildResultCard(result, style) {
+  function buildResultCard(result) {
     var ratio = result.width / result.height;
     var figure = h("figure", {
       class: "result",
@@ -2439,7 +2558,7 @@
       h("img", {
         class: "result__img",
         src: result.src,
-        alt: style.label + " edit — " + result.width + " × " + result.height,
+        alt: result.label + " — " + result.width + " × " + result.height,
         width: String(result.width),
         height: String(result.height),
         decoding: "async",
@@ -2448,7 +2567,7 @@
     );
 
     view.addEventListener("click", function () {
-      openLightbox(resultRecord(result, style));
+      openLightbox(resultRecord(result));
     });
 
     var image = view.firstElementChild;
@@ -2495,13 +2614,25 @@
         text: result.width + " × " + result.height
       }),
       h("span", { class: "result-meta__dot", "aria-hidden": "true" }),
-      h("span", { class: "result-meta__item", text: "JPEG" }),
-      h("span", { class: "result-meta__dot", "aria-hidden": "true" }),
+      h("span", { class: "result-meta__item", text: result.format }),
+      h("span", {
+        class: "result-meta__dot result-meta__dot--style",
+        "aria-hidden": "true"
+      }),
       h("span", {
         class: "result-meta__item result-meta__style",
-        text: style.label
+        text: result.label
       })
     );
+
+    var price = formatPrice(result.price);
+
+    if (price) {
+      meta.append(
+        h("span", { class: "result-meta__dot", "aria-hidden": "true" }),
+        h("span", { class: "result-meta__item", text: price })
+      );
+    }
 
     var reuse = h(
       "button",
@@ -2555,6 +2686,697 @@
   }
 
   /* ------------------------------------------------------------------------
+     Image model client
+     ------------------------------------------------------------------------
+     The studio does not ship a model of its own: every turn is posted to the
+     project's image API, which fronts flymyai/nano-banana-2_1. The local
+     Canvas 2D grade stays as an honest fallback for offline previews, a
+     missing server key or a provider outage — and the reply always says when
+     that happened.
+     ------------------------------------------------------------------------ */
+
+  function canReachImageApi() {
+    return (
+      typeof window.fetch === "function" &&
+      typeof window.FormData === "function"
+    );
+  }
+
+  function apiModelName() {
+    return state.imageModel || IMAGE_MODEL_FALLBACK;
+  }
+
+  function modelShortName() {
+    var model = apiModelName();
+    var slash = model.lastIndexOf("/");
+    var short = slash >= 0 ? model.slice(slash + 1) : model;
+    return short || IMAGE_MODEL_FALLBACK;
+  }
+
+  function modelSlug() {
+    var slug = modelShortName()
+      .replace(/[^A-Za-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .toLowerCase();
+    return slug || "model";
+  }
+
+  function prettyModelName() {
+    var short = modelShortName().replace(/(\d)_(\d)/g, "$1.$2");
+    var parts = short.split("-").filter(Boolean);
+
+    if (!parts.length) {
+      return "The image model";
+    }
+
+    return parts
+      .map(function (part) {
+        if (/^\d/.test(part)) {
+          return part;
+        }
+        return part.charAt(0).toUpperCase() + part.slice(1);
+      })
+      .join(" ");
+  }
+
+  function apiDefaults() {
+    var options = state.imageOptions;
+    var source =
+      options && options.defaults && typeof options.defaults === "object"
+        ? options.defaults
+        : {};
+    var merged = {};
+
+    Object.keys(IMAGE_DEFAULTS).forEach(function (key) {
+      var value = source[key];
+      merged[key] = value === undefined || value === null ? IMAGE_DEFAULTS[key] : value;
+    });
+
+    return merged;
+  }
+
+  function setEngineState(kind) {
+    var pill = refs.enginePill;
+
+    if (!pill) {
+      return;
+    }
+
+    var label = refs.engineLabel;
+    var tech = refs.engineTech;
+    var composer = refs.composerEngine;
+
+    pill.classList.toggle("engine-pill--fallback", kind !== "model");
+
+    if (kind === "model") {
+      if (label) {
+        label.textContent = "Image model";
+      }
+      if (tech) {
+        tech.textContent = modelShortName();
+      }
+      if (composer) {
+        composer.textContent = "Image model";
+      }
+      pill.setAttribute(
+        "title",
+        "Every turn is rendered by " + apiModelName() + " through the studio image API."
+      );
+      return;
+    }
+
+    if (kind === "loading") {
+      if (label) {
+        label.textContent = "Image model";
+      }
+      if (tech) {
+        tech.textContent = "connecting";
+      }
+      if (composer) {
+        composer.textContent = "Image model";
+      }
+      pill.setAttribute("title", "Checking the studio image API.");
+      return;
+    }
+
+    if (label) {
+      label.textContent = "Local fallback";
+    }
+    if (tech) {
+      tech.textContent = "Canvas 2D";
+    }
+    if (composer) {
+      composer.textContent = "Local grade";
+    }
+    pill.setAttribute(
+      "title",
+      "The image API is not reachable, so every turn falls back to the local Canvas 2D grade."
+    );
+  }
+
+  function syncLimits() {
+    var options = state.imageOptions;
+    var limits = options && options.limits ? options.limits : null;
+    var bytes = limits ? Number(limits.max_reference_bytes) : 0;
+
+    if (!bytes || !Number.isFinite(bytes) || !refs.dropzoneCopy) {
+      return;
+    }
+
+    var megabytes = Math.max(1, Math.round(bytes / (1024 * 1024)));
+    refs.dropzoneCopy.textContent =
+      "JPEG, PNG or WebP · up to " + megabytes + " MB each";
+  }
+
+  async function loadImageOptions() {
+    state.apiState = "loading";
+    setEngineState("loading");
+
+    if (!canReachImageApi()) {
+      state.apiState = "unavailable";
+      setEngineState("local");
+      return null;
+    }
+
+    var controller =
+      typeof AbortController === "function" ? new AbortController() : null;
+    var timer = window.setTimeout(function () {
+      if (controller) {
+        controller.abort();
+      }
+    }, OPTIONS_TIMEOUT_MS);
+
+    try {
+      var response = await window.fetch(IMAGE_API.options, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+        signal: controller ? controller.signal : undefined
+      });
+
+      if (!response.ok) {
+        throw new Error("options " + response.status);
+      }
+
+      var payload = await response.json();
+
+      if (!payload || typeof payload !== "object") {
+        throw new Error("options payload");
+      }
+
+      state.imageOptions = payload;
+      if (typeof payload.model === "string" && payload.model) {
+        state.imageModel = payload.model;
+      }
+      state.apiState = "ready";
+      syncLimits();
+      setEngineState("model");
+      return payload;
+    } catch (error) {
+      state.imageOptions = null;
+      state.apiState = "unavailable";
+      setEngineState("local");
+      return null;
+    } finally {
+      window.clearTimeout(timer);
+    }
+  }
+
+  function mimeFromSource(src) {
+    if (typeof src !== "string" || !src) {
+      return "";
+    }
+
+    if (src.indexOf("data:") === 0) {
+      var semicolon = src.indexOf(";");
+      return semicolon > 5 ? src.slice(5, semicolon) : "";
+    }
+
+    var clean = src.split("?")[0].split("#")[0].toLowerCase();
+
+    if (/\.png$/.test(clean)) {
+      return "image/png";
+    }
+    if (/\.webp$/.test(clean)) {
+      return "image/webp";
+    }
+    if (/\.jpe?g$/.test(clean)) {
+      return "image/jpeg";
+    }
+    if (/\.gif$/.test(clean)) {
+      return "image/gif";
+    }
+    if (/\.heic$/.test(clean)) {
+      return "image/heic";
+    }
+    if (/\.heif$/.test(clean)) {
+      return "image/heif";
+    }
+
+    return "";
+  }
+
+  function formatLabelFor(mime, src) {
+    var resolved = mime || mimeFromSource(src);
+    return FORMAT_LABELS[resolved] || "Image";
+  }
+
+  function extensionForMime(mime, src) {
+    var resolved = mime || mimeFromSource(src);
+    return MIME_TO_EXTENSION[resolved] || (resolved === "image/png" ? "png" : "jpg");
+  }
+
+  function modelError(message, code) {
+    var error = new Error(message);
+    error.code = code || "MODEL_UNAVAILABLE";
+    return error;
+  }
+
+  function cancelledError() {
+    var error = new Error("The render was cancelled.");
+    error.cancelled = true;
+    return error;
+  }
+
+  function imageApiError(status, payload) {
+    var problem = payload && payload.error ? payload.error : null;
+    var code = problem && typeof problem.code === "string" ? problem.code : "";
+    var message = problem && typeof problem.message === "string" ? problem.message : "";
+    var copy = API_ERROR_COPY[code];
+
+    if (!copy) {
+      if (status === 429) {
+        copy = "Too many requests — wait a moment and try again.";
+      } else if (status === 413) {
+        copy = "That request was too large for the server.";
+      } else if (status === 403) {
+        copy = "This page isn’t allowed to call the image API.";
+      } else if (status >= 500) {
+        copy = "The image service is unavailable right now.";
+      } else if (status >= 400) {
+        copy = "The server couldn’t accept that request.";
+      } else {
+        copy = "The image request failed.";
+      }
+    }
+
+    var failure = new Error(copy);
+    failure.code = code || (status ? "HTTP_" + status : "MODEL_UNAVAILABLE");
+    failure.status = status || 0;
+    failure.detail = message;
+    return failure;
+  }
+
+  function referenceFilename(attachment, mime) {
+    var base = safeFilename(attachment && attachment.name, "reference");
+    base = base.replace(/\.[a-z0-9]{2,5}$/i, "");
+    return (base || "reference") + "." + extensionForMime(mime);
+  }
+
+  async function referenceEntry(attachment) {
+    var src = attachment && attachment.src;
+
+    if (typeof src !== "string" || !src) {
+      throw modelError("One of the attachments could not be read.", "REFERENCE_UNREADABLE");
+    }
+
+    if (src.indexOf("data:") === 0) {
+      var blob = dataUrlToBlob(src);
+
+      if (!blob.size) {
+        throw modelError("One of the attachments is empty.", "REFERENCE_UNREADABLE");
+      }
+
+      return {
+        kind: "file",
+        blob: blob,
+        name: referenceFilename(attachment, blob.type || mimeFromSource(src)),
+        bytes: blob.size
+      };
+    }
+
+    if (/^https?:\/\//i.test(src) && src.indexOf(window.location.origin + "/") !== 0) {
+      return { kind: "url", url: src, bytes: src.length };
+    }
+
+    var response = await window.fetch(src, { credentials: "same-origin" });
+
+    if (!response.ok) {
+      throw modelError("The sample image could not be read.", "REFERENCE_UNREADABLE");
+    }
+
+    var fileBlob = await response.blob();
+
+    if (!fileBlob.size) {
+      throw modelError("One of the attachments is empty.", "REFERENCE_UNREADABLE");
+    }
+
+    return {
+      kind: "file",
+      blob: fileBlob,
+      name: referenceFilename(attachment, fileBlob.type || mimeFromSource(src)),
+      bytes: fileBlob.size
+    };
+  }
+
+  async function collectReferences(request) {
+    var attachments =
+      request.attachments && request.attachments.length
+        ? request.attachments
+        : request.source
+          ? [request.source]
+          : [];
+
+    var references = [];
+    var seen = Object.create(null);
+    var total = 0;
+
+    for (var i = 0; i < attachments.length; i += 1) {
+      if (references.length >= MAX_REFERENCE_COUNT) {
+        break;
+      }
+
+      var entry;
+
+      try {
+        entry = await referenceEntry(attachments[i]);
+      } catch (error) {
+        continue;
+      }
+
+      var key = entry.kind === "file" ? entry.name + ":" + entry.bytes : entry.url;
+
+      if (seen[key]) {
+        continue;
+      }
+      if (entry.bytes > MAX_BYTES) {
+        continue;
+      }
+      if (total + entry.bytes > MAX_TOTAL_REFERENCE_BYTES) {
+        break;
+      }
+
+      seen[key] = true;
+      total += entry.bytes;
+      references.push(entry);
+    }
+
+    if (!references.length) {
+      throw modelError(
+        "None of the attached images could be prepared for the model.",
+        "REFERENCE_UNREADABLE"
+      );
+    }
+
+    return references;
+  }
+
+  function promptForModel(request) {
+    var text = String(request.text || "").replace(/\s+/g, " ").trim();
+
+    if (request.implicit) {
+      return text
+        ? "Continue from the previous result. " + text
+        : "Continue the previous edit. Keep the subject, framing and detail, and refine the light and colour.";
+    }
+
+    if (text) {
+      return text;
+    }
+
+    return "Refine this image. Keep the subject, framing and detail, and improve the light and colour.";
+  }
+
+  function buildImageForm(request, references) {
+    var defaults = apiDefaults();
+    var form = new FormData();
+
+    form.append("prompt", promptForModel(request));
+    form.append("aspect_ratio", String(defaults.aspect_ratio || "auto"));
+    form.append("resolution", String(defaults.resolution || "1K"));
+    form.append("num_images", "1");
+    form.append("thinking_level", String(defaults.thinking_level || "medium"));
+    form.append("safety_tolerance", String(defaults.safety_tolerance || "4"));
+    form.append("enable_web_search", defaults.enable_web_search ? "true" : "false");
+
+    references.forEach(function (reference) {
+      if (reference.kind === "url") {
+        form.append("image_urls", reference.url);
+        return;
+      }
+
+      form.append("image_urls", reference.blob, reference.name);
+    });
+
+    return form;
+  }
+
+  async function readImageStream(response) {
+    if (!response.body || typeof response.body.getReader !== "function") {
+      throw modelError("The image service streamed an unreadable answer.", "BAD_RESPONSE");
+    }
+
+    var reader = response.body.getReader();
+    var decoder = new TextDecoder();
+    var buffer = "";
+    var latest = null;
+    var images = null;
+
+    while (true) {
+      var step = await reader.read();
+
+      if (step.done) {
+        break;
+      }
+
+      buffer += decoder.decode(step.value, { stream: true });
+      var lines = buffer.split(/\r?\n/);
+      buffer = lines.pop();
+
+      for (var i = 0; i < lines.length; i += 1) {
+        var line = lines[i].trim();
+
+        if (line.indexOf("data:") !== 0) {
+          continue;
+        }
+
+        var data = line.slice(5).trim();
+
+        if (!data || data === "[DONE]") {
+          continue;
+        }
+
+        try {
+          var frame = JSON.parse(data);
+          latest = frame;
+          if (frame && Array.isArray(frame.images) && frame.images.length) {
+            images = frame;
+          }
+        } catch (error) {
+          // Status frames can be plain text; keep reading.
+        }
+      }
+    }
+
+    if (!images && !latest) {
+      throw modelError("The image service streamed no result.", "BAD_RESPONSE");
+    }
+
+    return images || latest;
+  }
+
+  async function readImagePayload(response) {
+    var contentType = "";
+
+    try {
+      contentType = response.headers.get("content-type") || "";
+    } catch (error) {
+      contentType = "";
+    }
+
+    if (!response.ok) {
+      var problem = null;
+
+      if (contentType.indexOf("json") !== -1) {
+        try {
+          problem = await response.json();
+        } catch (error) {
+          problem = null;
+        }
+      }
+
+      if (!problem) {
+        var text = "";
+
+        try {
+          text = await response.text();
+        } catch (error) {
+          text = "";
+        }
+
+        problem = text
+          ? { error: { message: text.slice(0, 240) } }
+          : null;
+      }
+
+      throw imageApiError(response.status, problem);
+    }
+
+    if (contentType.indexOf("text/event-stream") !== -1) {
+      return readImageStream(response);
+    }
+
+    try {
+      return await response.json();
+    } catch (error) {
+      throw modelError("The image service returned an unreadable answer.", "BAD_RESPONSE");
+    }
+  }
+
+  function imageFromPayload(payload) {
+    if (!payload || typeof payload !== "object") {
+      throw modelError("The image service returned no result.", "BAD_RESPONSE");
+    }
+
+    var list = payload.images;
+
+    if (!Array.isArray(list) || !list.length || !list[0]) {
+      throw modelError("The image model returned no image.", "NO_IMAGE");
+    }
+
+    var raw = list[0];
+    var src = raw.url || raw.data_url || raw.remote_url || raw.data || "";
+
+    if (typeof src !== "string" || !src) {
+      throw modelError("The image model returned an empty image.", "NO_IMAGE");
+    }
+
+    return {
+      src: src,
+      width: Number(raw.width) || 0,
+      height: Number(raw.height) || 0,
+      mime: typeof raw.mime_type === "string" && raw.mime_type ? raw.mime_type : mimeFromSource(src),
+      description: typeof payload.description === "string" ? payload.description : "",
+      warnings: Array.isArray(payload.warnings)
+        ? payload.warnings.filter(function (entry) {
+            return typeof entry === "string" && entry.trim();
+          })
+        : [],
+      price: payload.calculated_price || null,
+      model: typeof payload.model === "string" && payload.model ? payload.model : apiModelName(),
+      route: typeof payload.route === "string" ? payload.route : ""
+    };
+  }
+
+  async function measureImage(image) {
+    if (image.width > 0 && image.height > 0) {
+      return image;
+    }
+
+    var loaded = await loadImage(image.src);
+    image.width = loaded.naturalWidth || loaded.width || 0;
+    image.height = loaded.naturalHeight || loaded.height || 0;
+
+    if (!image.width || !image.height) {
+      throw modelError("The returned image could not be measured.", "BAD_IMAGE");
+    }
+
+    return image;
+  }
+
+  async function requestModelImage(request, job) {
+    if (!canReachImageApi()) {
+      throw modelError(
+        "The image API is not reachable from this page.",
+        "MODEL_UNAVAILABLE"
+      );
+    }
+
+    var references = await collectReferences(request);
+
+    if (job.cancelled) {
+      throw cancelledError();
+    }
+
+    var endpoint = references.length ? IMAGE_API.edits : IMAGE_API.generate;
+    var controller =
+      typeof AbortController === "function" ? new AbortController() : null;
+    var timedOut = false;
+
+    job.controller = controller;
+
+    var timer = window.setTimeout(function () {
+      timedOut = true;
+      if (controller) {
+        controller.abort();
+      }
+    }, REQUEST_TIMEOUT_MS);
+
+    try {
+      var response = await window.fetch(endpoint, {
+        method: "POST",
+        body: buildImageForm(request, references),
+        headers: { Accept: "application/json, text/event-stream" },
+        credentials: "same-origin",
+        signal: controller ? controller.signal : undefined
+      });
+
+      var payload = await readImagePayload(response);
+
+      if (job.cancelled) {
+        throw cancelledError();
+      }
+
+      var image = imageFromPayload(payload);
+
+      if (image.model) {
+        state.imageModel = image.model;
+      }
+
+      return image;
+    } catch (error) {
+      if (job.cancelled) {
+        throw cancelledError();
+      }
+
+      if (timedOut) {
+        throw modelError(
+          "The image model did not finish within two and a half minutes.",
+          "MODEL_TIMEOUT"
+        );
+      }
+
+      if (error && error.code) {
+        throw error;
+      }
+
+      throw modelError(
+        "The image service could not be reached.",
+        "MODEL_UNAVAILABLE"
+      );
+    } finally {
+      window.clearTimeout(timer);
+      job.controller = null;
+    }
+  }
+
+  function shortErrorReason(error) {
+    if (!error) {
+      return "";
+    }
+
+    if (error.code === "MODEL_UNAVAILABLE") {
+      return "the image API was not reachable";
+    }
+    if (error.code === "MODEL_TIMEOUT") {
+      return "the model timed out";
+    }
+    if (error.code === "IMAGE_PROVIDER_UNAVAILABLE") {
+      return "the server has no image model key";
+    }
+    if (error.code === "IMAGE_UPSTREAM_FAILED") {
+      return "the provider refused the request";
+    }
+    if (error.code === "IMAGE_UPSTREAM_TIMEOUT") {
+      return "the provider timed out";
+    }
+    if (error.status === 429) {
+      return "the API was rate limited";
+    }
+    if (error.status === 404 || error.status === 405) {
+      return "the image API is not served here";
+    }
+    if (error.status === 403) {
+      return "the API rejected this page’s origin";
+    }
+    if (error.status) {
+      return "the API answered " + error.status;
+    }
+
+    return "the image API failed";
+  }
+
+  /* ------------------------------------------------------------------------
      Turn orchestration
      ------------------------------------------------------------------------ */
 
@@ -2570,46 +3392,95 @@
     return attachments[attachments.length - 1];
   }
 
-  function buildFilename(styleId) {
+  function buildFilename(prefix, extension) {
     state.renderCount += 1;
     var stamp = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+    var safePrefix = safeFilename(prefix, "image").replace(/\s+/g, "-");
+    var safeExtension = String(extension || "jpg").replace(/[^a-z0-9]/gi, "") || "jpg";
+
     return (
       "bigmix-" +
-      styleId +
+      safePrefix +
       "-" +
       stamp +
       "-" +
       String(state.renderCount).padStart(2, "0") +
-      ".jpg"
+      "." +
+      safeExtension
     );
   }
 
-  function beginWorking(request, source, style) {
+  function beginWorking(request, source, style, mode) {
+    var modelMode = mode === "model";
+    var stages = modelMode ? MODEL_STAGES : WORKING_STAGES;
+    var referenceCount = request.attachments.length || 1;
+
     var article = h("article", { class: "message message--assistant" });
     article.append(buildAssistantHead(new Date()));
 
     var orb = h("span", { class: "working__orb", "aria-hidden": "true" });
     var title = h("p", {
       class: "working__title",
-      text: WORKING_STAGES[0]
+      text: stages[0]
     });
     var detail = h("p", {
       class: "working__detail",
-      text:
-        style.label +
-        " · " +
-        (source.width || 0) +
-        " × " +
-        (source.height || 0) +
-        " · preserving composition"
+      text: modelMode
+        ? prettyModelName() +
+          " · " +
+          (source.width || 0) +
+          " × " +
+          (source.height || 0) +
+          " · " +
+          referenceCount +
+          " " +
+          plural(referenceCount, "reference") +
+          " sent"
+        : style.label +
+          " · " +
+          (source.width || 0) +
+          " × " +
+          (source.height || 0) +
+          " · preserving composition"
     });
-    var copy = h(
-      "div",
-      { class: "working__copy" },
-      title,
-      detail
-    );
+    var copy = h("div", { class: "working__copy" }, title, detail);
     var time = h("span", { class: "working__time", text: "0.0s" });
+
+    var job = {
+      article: article,
+      working: null,
+      timer: 0,
+      request: request,
+      controller: null,
+      cancelled: false,
+      cancel: null
+    };
+
+    var cancel = null;
+
+    if (modelMode) {
+      cancel = h("button", {
+        class: "working__cancel",
+        type: "button",
+        text: "Cancel",
+        "aria-label": "Cancel this render"
+      });
+
+      cancel.addEventListener("click", function () {
+        job.cancelled = true;
+        cancel.disabled = true;
+        title.textContent = "Cancelling";
+        detail.textContent = "Releasing the model request";
+
+        if (job.controller) {
+          try {
+            job.controller.abort();
+          } catch (error) {
+            // The request may already be settled; nothing else to stop.
+          }
+        }
+      });
+    }
 
     var working = h(
       "div",
@@ -2617,12 +3488,16 @@
         class: "working",
         role: "status",
         "aria-live": "polite",
-        "aria-label": "Rendering the edit"
+        "aria-label": modelMode ? "Rendering with the image model" : "Rendering the local grade"
       },
       orb,
       copy,
-      time
+      time,
+      cancel
     );
+
+    job.working = working;
+    job.cancel = cancel;
 
     article.append(working);
     mountMessage(article, { forceScroll: true, smooth: true });
@@ -2631,37 +3506,96 @@
     var stage = 0;
     var lastStageFlip = startedAt;
 
-    var timer = window.setInterval(function () {
+    job.timer = window.setInterval(function () {
+      if (job.cancelled) {
+        return;
+      }
+
       var elapsed = (performance.now() - startedAt) / 1000;
       time.textContent = elapsed.toFixed(1) + "s";
 
       if (performance.now() - lastStageFlip > 3000) {
-        stage = (stage + 1) % WORKING_STAGES.length;
-        title.textContent = WORKING_STAGES[stage];
+        stage = (stage + 1) % stages.length;
+        title.textContent = stages[stage];
         lastStageFlip = performance.now();
       }
     }, 110);
 
-    var job = {
-      article: article,
-      working: working,
-      timer: timer,
-      request: request
-    };
-
     activeJobs.add(job);
     return job;
+  }
+
+  function markJobFallback(job, error) {
+    if (!job || !job.working || !job.working.isConnected) {
+      return;
+    }
+
+    var title = job.working.querySelector(".working__title");
+    var detail = job.working.querySelector(".working__detail");
+
+    job.working.classList.add("working--fallback");
+
+    if (title) {
+      title.textContent = "Falling back to the local grade";
+    }
+
+    if (detail) {
+      detail.textContent =
+        "The image model is unavailable — " + shortErrorReason(error) + ".";
+    }
+
+    if (job.cancel) {
+      job.cancel.hidden = true;
+    }
   }
 
   function cleanupJob(job) {
     if (!job) {
       return;
     }
+
     if (job.timer) {
       window.clearInterval(job.timer);
       job.timer = 0;
     }
+
+    if (job.controller) {
+      job.cancelled = true;
+      try {
+        job.controller.abort();
+      } catch (error) {
+        // Already settled.
+      }
+      job.controller = null;
+    }
+
     activeJobs.delete(job);
+  }
+
+  function buildResultNote(options) {
+    var tone = options.tone || "warn";
+    var note = h("div", {
+      class: "result-note" + (tone === "soft" ? " result-note--soft" : ""),
+      role: tone === "warn" ? "note" : "status"
+    });
+
+    note.append(
+      h(
+        "span",
+        { class: "result-note__icon", "aria-hidden": "true" },
+        createIcon(tone === "warn" ? "alert" : "sparkle")
+      )
+    );
+
+    var body = h("p", { class: "result-note__copy" });
+
+    if (options.title) {
+      body.append(h("strong", { text: options.title }));
+    }
+
+    body.append(document.createTextNode(options.text || ""));
+    note.append(body);
+    return note;
   }
 
   function completeJob(job, payload) {
@@ -2669,36 +3603,87 @@
     job.working.remove();
 
     var style = payload.style;
-    var rendered = payload.rendered;
+    var image = payload.image;
     var source = payload.source;
     var request = payload.request;
+    var engine = payload.engine === "model" ? "model" : "local";
+    var mime = image.mime || mimeFromSource(image.src) || "image/jpeg";
+    var format = formatLabelFor(mime, image.src);
+    var label = engine === "model" ? prettyModelName() : style.label;
+
+    var filename =
+      engine === "model"
+        ? buildFilename(modelSlug(), extensionForMime(mime, image.src))
+        : buildFilename(style.id, "jpg");
 
     var result = {
       id: uniqueId("render"),
-      filename: buildFilename(style.id),
-      src: rendered.src,
-      width: rendered.width,
-      height: rendered.height,
+      filename: filename,
+      src: image.src,
+      width: image.width,
+      height: image.height,
+      mime: mime,
+      format: format,
+      engine: engine,
+      label: label,
+      price: image.price || null,
+      description: image.description || "",
+      warnings: image.warnings || [],
+      route: image.route || "",
       styleId: style.id,
       styleLabel: style.label,
       sourceName: source.name,
       createdAt: new Date()
     };
 
-    state.lastResult = result;
-    state.lastStyleId = style.id;
+    if (engine === "model") {
+      state.lastStyleId = style.id;
+      setEngineState("model");
+    } else {
+      state.lastStyleId = style.id;
+      setEngineState("local");
+    }
 
-    job.article.append(
-      buildReply({
-        style: style,
-        request: request,
-        result: result,
-        source: source
-      }),
-      buildResultCard(result, style)
-    );
+    state.lastResult = result;
+
+    var reply = buildReply({
+      style: style,
+      request: request,
+      result: result,
+      source: source,
+      engine: engine,
+      description: image.description || ""
+    });
+
+    job.article.append(reply);
+
+    if (engine === "local") {
+      job.article.append(
+        buildResultNote({
+          tone: "warn",
+          title: "Rendered locally instead. ",
+          text:
+            "The image model wasn’t available (" +
+            shortErrorReason(payload.error) +
+            "), so this frame was graded here with Canvas 2D. The result keeps the source composition and resolution."
+        })
+      );
+    }
+
+    if (result.warnings.length) {
+      job.article.append(
+        buildResultNote({
+          tone: "soft",
+          title: "From the image API. ",
+          text: result.warnings.join(" ")
+        })
+      );
+    }
+
+    job.article.append(buildResultCard(result));
 
     job.article.dataset.state = "done";
+    job.article.dataset.engine = engine;
     updateClearButton();
     updateComposer();
 
@@ -2725,6 +3710,40 @@
     }
   }
 
+  function cancelJob(job, request) {
+    cleanupJob(job);
+
+    if (job.working && job.working.isConnected) {
+      job.working.remove();
+    }
+
+    var restored = restoreAttachments(request.attachments);
+
+    if (!job.article.querySelector(".result") && !job.article.querySelector(".error-card")) {
+      job.article.remove();
+    }
+
+    updateComposer();
+    updateClearButton();
+
+    toast(
+      "Render cancelled." +
+        (restored.length
+          ? " Your " +
+            plural(restored.length, "image") +
+            (restored.length === 1 ? " is" : " are") +
+            " back in the composer."
+          : ""),
+      "info"
+    );
+
+    if (nearBottom()) {
+      scrollToBottom({ force: true });
+    } else {
+      updateJump();
+    }
+  }
+
   function failJob(job, request, error) {
     cleanupJob(job);
     job.working.remove();
@@ -2734,6 +3753,7 @@
       (error && error.message
         ? error.message
         : "Something interrupted the render.") +
+      (error && error.detail ? " " + error.detail : "") +
       (restored.length
         ? " Your " +
           plural(restored.length, "image") +
@@ -2800,16 +3820,66 @@
 
     request.style = style;
 
+    var modelMode = canReachImageApi();
+    var startedAt = performance.now();
+
     state.busy = true;
     var token = state.generation;
-    var job = beginWorking(request, source, style);
+    var job = beginWorking(request, source, style, modelMode ? "model" : "local");
     updateComposer();
     updateClearButton();
 
-    var startedAt = performance.now();
-
     try {
-      await sleep(isReducedMotion() ? 90 : 380);
+      var image = null;
+      var apiError = null;
+
+      if (modelMode) {
+        try {
+          image = await requestModelImage(request, job);
+        } catch (error) {
+          if (error && error.cancelled) {
+            throw error;
+          }
+          apiError = error;
+        }
+      }
+
+      if (token !== state.generation) {
+        return;
+      }
+
+      if (image) {
+        image = await measureImage(image);
+
+        if (token !== state.generation) {
+          return;
+        }
+
+        var elapsedModel = performance.now() - startedAt;
+        var floor = isReducedMotion() ? 80 : 420;
+
+        if (elapsedModel < floor) {
+          await sleep(floor - elapsedModel);
+        }
+
+        if (token !== state.generation) {
+          return;
+        }
+
+        completeJob(job, {
+          image: image,
+          style: style,
+          request: request,
+          source: source,
+          engine: "model",
+          description: image.description
+        });
+
+        return;
+      }
+
+      markJobFallback(job, apiError);
+      await sleep(isReducedMotion() ? 60 : 240);
       await nextFrame();
 
       if (token !== state.generation) {
@@ -2834,15 +3904,28 @@
       }
 
       completeJob(job, {
-        rendered: rendered,
+        image: {
+          src: rendered.src,
+          width: rendered.width,
+          height: rendered.height,
+          mime: "image/jpeg"
+        },
         style: style,
         request: request,
-        source: source
+        source: source,
+        engine: "local",
+        error: apiError
       });
     } catch (error) {
       if (token !== state.generation) {
         return;
       }
+
+      if (error && error.cancelled) {
+        cancelJob(job, request);
+        return;
+      }
+
       failJob(job, request, error);
     } finally {
       if (token === state.generation) {
@@ -3355,6 +4438,9 @@
     bindDialog();
     bindDragAndDrop();
 
+    setEngineState(canReachImageApi() ? "loading" : "local");
+    void loadImageOptions();
+
     renderAttachmentRow();
     updateComposer();
     updateClearButton();
@@ -3397,8 +4483,25 @@
         pending: state.pending.length,
         busy: state.busy,
         hasResult: Boolean(state.lastResult),
-        messages: refs.messages ? refs.messages.childElementCount : 0
+        messages: refs.messages ? refs.messages.childElementCount : 0,
+        engine: state.lastResult ? state.lastResult.engine : null,
+        apiState: state.apiState,
+        model: apiModelName()
       };
+    },
+    getOptions: function () {
+      return state.imageOptions;
+    },
+    buildForm: function (text, attachments) {
+      var references = (attachments || []).map(function (attachment) {
+        return attachment.src;
+      });
+      var form = buildImageForm({ text: text, attachments: attachments || [] }, references);
+      var fields = {};
+      form.forEach(function (value, key) {
+        fields[key] = value;
+      });
+      return fields;
     }
   };
 })();

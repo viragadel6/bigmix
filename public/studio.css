@@ -1,6 +1,6 @@
 /* ==========================================================================
    Bigmix Studio
-   A local-first, conversational image editing surface.
+   A conversational image editing surface for the studio image model.
    ========================================================================== */
 
 :root {
@@ -392,6 +392,15 @@ figcaption {
 .engine-pill__tech {
   color: var(--text-3);
   letter-spacing: 0.055em;
+}
+
+.engine-pill--fallback .engine-pill__dot {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px rgba(242, 192, 124, 0.1);
+}
+
+.engine-pill--fallback .engine-pill__tech {
+  color: rgba(242, 192, 124, 0.68);
 }
 
 .topbar__button {
@@ -1061,6 +1070,43 @@ figcaption {
   letter-spacing: 0.03em;
 }
 
+.working__cancel {
+  cursor: pointer;
+  flex: none;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 10.5px;
+  letter-spacing: 0.015em;
+  transition:
+    color 0.18s ease,
+    background 0.18s ease,
+    border-color 0.18s ease;
+}
+
+.working__cancel:hover {
+  border-color: var(--line-2);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text);
+}
+
+.working__cancel:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.working--fallback .working__orb::before {
+  border-top-color: var(--accent-2);
+  border-right-color: rgba(242, 192, 124, 0.2);
+}
+
+.working--fallback .working__title {
+  color: var(--accent-2);
+}
+
 /* Result ----------------------------------------------------------------- */
 
 .result {
@@ -1253,6 +1299,68 @@ figcaption {
 .result-meta__action .ic {
   width: 12px;
   height: 12px;
+}
+
+/* Result note ------------------------------------------------------------ */
+
+.result-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: min(100%, 540px);
+  margin: 0 0 15px;
+  padding: 11px 13px;
+  border: 1px solid rgba(242, 192, 124, 0.16);
+  border-radius: 13px;
+  background: rgba(242, 192, 124, 0.045);
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.58;
+}
+
+.result-note--soft {
+  border-color: rgba(255, 255, 255, 0.09);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+
+.result-note__icon {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  margin-top: 1px;
+  border-radius: 7px;
+  background: rgba(242, 192, 124, 0.1);
+  color: var(--accent-2);
+}
+
+.result-note--soft .result-note__icon {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-3);
+}
+
+.result-note__icon .ic {
+  width: 12px;
+  height: 12px;
+}
+
+.result-note__copy {
+  min-width: 0;
+  flex: 1;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.result-note__copy strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.result-note--soft .result-note__copy strong {
+  color: var(--text-2);
 }
 
 /* Error ------------------------------------------------------------------ */
@@ -2450,6 +2558,16 @@ figcaption {
     font-size: 12px;
   }
 
+  .working__time {
+    display: none;
+  }
+
+  .working__cancel {
+    height: 25px;
+    padding: 0 9px;
+    font-size: 10px;
+  }
+
   .result__download {
     opacity: 1;
     transform: none;
@@ -2644,7 +2762,8 @@ figcaption {
     max-width: 122px;
   }
 
-  .result-meta__style {
+  .result-meta__style,
+  .result-meta__dot--style {
     display: none;
   }
 

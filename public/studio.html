@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <meta name="theme-color" content="#090909">
   <meta name="color-scheme" content="dark">
-  <meta name="description" content="A local-first image editing conversation. Attach a photograph, describe the light you want, and iterate with Canvas 2D — nothing leaves your device.">
-  <title>Bigmix Studio — Local image editing</title>
+  <meta name="description" content="A conversational image editor. Attach a photograph, describe the light you want, and iterate with the studio image model — every result becomes the next source.">
+  <title>Bigmix Studio — Image model editor</title>
 
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='20' fill='%23120f0c'/%3E%3Crect x='13' y='15' width='38' height='34' rx='9' fill='none' stroke='%23f2c07c' stroke-width='2.4'/%3E%3Ccircle cx='25' cy='26' r='3' fill='%23f4d6a6'/%3E%3Cpath d='M17 42l10-11 7 7.5 5.5-6L47 42' fill='none' stroke='%23f2c07c' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="studio.css">
@@ -40,10 +40,6 @@
       <symbol id="i-sparkle" viewBox="0 0 24 24">
         <path d="M12 3.4 13.7 8.3 18.6 10l-4.9 1.7L12 16.6l-1.7-4.9L5.4 10l4.9-1.7L12 3.4Z"/>
         <path d="M18.8 16.4v4M16.8 18.4h4"/>
-      </symbol>
-      <symbol id="i-lock" viewBox="0 0 24 24">
-        <rect x="5" y="10.2" width="14" height="9.8" rx="2.4"/>
-        <path d="M8.2 10.2V7.6a3.8 3.8 0 0 1 7.6 0v2.6"/>
       </symbol>
       <symbol id="i-trash" viewBox="0 0 24 24">
         <path d="M4.5 7h15M9.4 7V5.2h5.2V7M6.8 7l.7 11.6a2 2 0 0 0 2 1.9h5a2 2 0 0 0 2-1.9L17.2 7"/>
@@ -90,11 +86,11 @@
       </a>
 
       <div class="topbar__tools">
-        <span class="engine-pill" title="Every edit is rendered by Canvas 2D inside this tab.">
+        <span class="engine-pill" id="engine-pill" title="Checking the studio image API.">
           <span class="engine-pill__dot" aria-hidden="true"></span>
-          <span class="engine-pill__label">On-device</span>
+          <span class="engine-pill__label" id="engine-label">Image model</span>
           <span class="engine-pill__rule" aria-hidden="true"></span>
-          <span class="engine-pill__tech">Canvas 2D</span>
+          <span class="engine-pill__tech" id="engine-tech">connecting</span>
         </span>
         <button class="topbar__button" id="clear-button" type="button" title="Clear conversation" aria-label="Clear conversation" disabled>
           <svg class="ic" aria-hidden="true"><use href="#i-trash"></use></svg>
@@ -109,7 +105,7 @@
             <svg class="ic" aria-hidden="true"><use href="#i-image"></use></svg>
           </span>
           <p class="dropzone__title">Drop to attach</p>
-          <p class="dropzone__copy">JPEG, PNG or WebP&nbsp;&nbsp;·&nbsp;&nbsp;up to 20 MB each</p>
+          <p class="dropzone__copy" id="dropzone-copy">JPEG, PNG or WebP · up to 10 MB each</p>
         </div>
       </div>
 
@@ -119,10 +115,10 @@
         <section class="empty" id="empty" aria-labelledby="empty-title">
           <span class="empty__badge">
             <span class="empty__badge-dot" aria-hidden="true"></span>
-            Local image workflow
+            Conversational editing
           </span>
           <h1 class="empty__title" id="empty-title">Keep the photograph.<br><em>Change the light.</em></h1>
-          <p class="empty__copy">Attach a portrait, a room, a frame from your camera roll. Describe the shift you want, then keep iterating. Every result is a deterministic local grade, rendered here with Canvas 2D — your images never leave this tab.</p>
+          <p class="empty__copy">Attach a portrait, a room, a frame from your camera roll. Describe the shift you want, then keep iterating. Each turn is rendered by the studio’s image model from your reference, and every result can become the next source.</p>
 
           <div class="empty__actions">
             <button class="button button--primary" id="empty-choose" type="button">
@@ -145,7 +141,7 @@
           <div class="empty__formats">
             <span class="empty__format">JPEG · PNG · WebP</span>
             <span class="empty__format">Up to 8 images</span>
-            <span class="empty__format">Full resolution preserved</span>
+            <span class="empty__format">Your reference drives the frame</span>
           </div>
         </section>
 
@@ -189,15 +185,15 @@
             <div class="composer__footer">
               <span class="composer__hint" id="composer-hint">Attach an image to begin.</span>
               <span class="composer__local">
-                <svg class="ic" aria-hidden="true"><use href="#i-lock"></use></svg>
-                Local only
+                <svg class="ic" aria-hidden="true"><use href="#i-sparkle"></use></svg>
+                <span id="composer-engine-label">Image model</span>
               </span>
             </div>
           </form>
 
           <p class="composer-note">
-            <svg class="ic" aria-hidden="true"><use href="#i-lock"></use></svg>
-            <span>Processed in this browser. Nothing is uploaded.</span>
+            <svg class="ic" aria-hidden="true"><use href="#i-sparkle"></use></svg>
+            <span>Your frame is sent to the studio image model. If it is unreachable, the local grade takes over.</span>
           </p>
 
           <div class="attach-menu" id="attach-menu" role="menu" aria-label="Add images" hidden>
