@@ -1739,10 +1739,10 @@
 
   function restoreAttachments(attachments) {
     if (!attachments || !attachments.length || state.pending.length > 0) {
-      return 0;
+      return [];
     }
 
-    var restored = 0;
+    var restored = [];
 
     attachments.forEach(function (attachment) {
       if (state.pending.length >= MAX_FILES) {
@@ -1751,11 +1751,12 @@
       if (isDuplicate(attachment)) {
         return;
       }
-      state.pending.push(Object.assign({}, attachment));
-      restored += 1;
+      var copy = Object.assign({}, attachment);
+      state.pending.push(copy);
+      restored.push(copy);
     });
 
-    if (restored) {
+    if (restored.length) {
       renderAttachmentRow({ scrollToEnd: true });
       updateComposer();
     }
@@ -2733,10 +2734,10 @@
       (error && error.message
         ? error.message
         : "Something interrupted the render.") +
-      (restored
+      (restored.length
         ? " Your " +
-          plural(restored, "image") +
-          (restored === 1 ? " was" : " were") +
+          plural(restored.length, "image") +
+          (restored.length === 1 ? " was" : " were") +
           " returned to the composer."
         : "");
 
@@ -2744,7 +2745,26 @@
       if (state.busy) {
         return;
       }
+
+      // The retry consumes the attachments again, so take them back out of the
+      // composer and drop the now-empty assistant shell.
+      if (restored.length) {
+        var ids = restored.map(function (attachment) {
+          return attachment.id;
+        });
+        state.pending = state.pending.filter(function (attachment) {
+          return ids.indexOf(attachment.id) === -1;
+        });
+        renderAttachmentRow();
+        updateComposer();
+      }
+
       card.remove();
+
+      if (!job.article.querySelector(".result")) {
+        job.article.remove();
+      }
+
       void runEdit(request);
     });
 
